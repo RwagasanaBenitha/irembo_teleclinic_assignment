@@ -1,0 +1,195 @@
+version: 2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# schema_tests.yml
+# Tests that would have caught both the referral rate and timezone bugs before
+# the April dashboard was published.
+# ─────────────────────────────────────────────────────────────────────────────
+
+models:
+
+  # ── Staging: stg_consultations_fixed ───────────────────────────────────────
+  - name: stg_consultations_fixed
+    description: >
+      Cleaned consultations with timezone correction applied and test accounts
+      removed. Foundation for all wait-time and volume metrics.
+
+    columns:
+      - name: consultation_id
+        description: "Primary key — one row per consultation."
+        tests:
+          - unique:
+              severity: error
+              config:
+                description: >
+                  Duplicate consultation_ids corrupt every downstream aggregation.
+                  A duplicate here would inflate consult counts and distort all
+                  rate metrics reported to the Ministry of Health.
+          - not_null:
+              severity: error
+              config:
+                description: >
+                  A null PK makes the row unresolvable; joins to clinical_outcomes
+                  and intake_flags silently drop it, causing undercounted metrics.
+
+      - name: patient_id
+        description: "Patient identifier. Must not be null or a TEST_ seed account."
+        tests:
+          - not_null:
+              severity: error
+              config:
+                description: >
+                  A null patient_id indicates a failed de-identification or ingestion
+                  error; such rows should never appear in health reporting.
+
+      - name: status
+        description: "Consultation lifecycle status."
+        tests:
+          - accepted_values:
+              values: ['completed', 'cancelled', 'no_show']
+              severity: warn
+              config:
+                description: >
+                  Unexpected status values (e.g. 'done', 'finished') suggest a
+                  schema change in the source system that has not been reflected in
+                  downstream filtering logic — completed consults drive all clinical
+                  rate metrics.
+
+      - name: wait_time_minutes
+        description: >
+          Clean wait time in minutes. Must be NULL (not negative) after tz correction.
+        tests:
+          - not_negative_wait_time:   # custom singular test — see tests/ folder
+              severity: error
+              config:
+                description: >
+                  A negative wait_time_minutes after timezone correction means the
+                  normalisation failed or a new offset variant was introduced.
+                  Negative waits flow into the average wait time metric and produce
+                  the observed 4-minute April anomaly.
+
+      - name: is_tz_corrected
+        description: "Boolean flag — true for records where UTC+2 offset was normalised."
+        tests:
+          - not_null:
+              severity: error
+              config:
+                description: >
+                  is_tz_corrected must always be populated (true or false). A null
+                  here means the detection logic did not evaluate, leaving potential
+                  tz bugs undetected and untracked.
+
+      - name: channel
+        description: "Request channel."
+        tests:
+          - accepted_values:
+              values: ['app', 'ussd']
+              severity: warn
+              config:
+                description: >
+                  New channels (e.g. web portal) need explicit handling before
+                  inclusion in operational metrics; an unknown value here is a
+                  silent data-coverage gap.
+
+  # ── Intermediate: int_referrals_classified ─────────────────────────────────
+  - name: int_referrals_classified
+    description: >
+      One row per completed consultation with referral_class assigned.
+      Used exclusively to build the monthly referral rate mart.
+
+    columns:
+      - name: consultation_id
+        description: "PK — one row per completed consultation."
+        tests:
+          - unique:
+              severity: error
+              config:
+                description: >
+                  Duplicates at this layer would double-count consultations in the
+                  monthly rate denominator, directly inflating or deflating
+                  all referral rate percentages.
+          - not_null:
+              severity: error
+              config:
+                description: >
+                  Null PKs are unresolvable and indicate an upstream join failure.
+
+      - name: referral_class
+        description: "Referral classification: doctor_referral | patient_requested_only | both | no_referral."
+        tests:
+          - not_null:
+              severity: error
+              config:
+                description: >
+                  A null referral_class means the CASE logic did not match — the
+                  row is silently excluded from all referral rate numerators,
+                  understating referral rates in clinical governance reports.
+          - accepted_values:
+              values: ['doctor_referral', 'patient_requested_only', 'both', 'no_referral']
+              severity: error
+              config:
+                description: >
+                  Any value outside these four classes indicates a logic error in
+                  the classification CASE statement; such rows cannot be correctly
+                  attributed to any metric and corrupt the monthly mart.
+
+  # ── Mart: mart_referral_rate_monthly ───────────────────────────────────────
+  - name: mart_referral_rate_monthly
+    description: >
+      Monthly summary of referral rates with doctor-issued and patient-requested
+      rates separated for comparability across the Feb–Apr period.
+
+    columns:
+      - name: consult_month
+        description: "Month grain PK — one row per calendar month."
+        tests:
+          - unique:
+              severity: error
+              config:
+                description: >
+                  Duplicate months would cause BI tools to sum or average the same
+                  month twice, producing incorrect trend lines in the MoH dashboard.
+          - not_null:
+              severity: error
+              config:
+                description: >
+                  A null month means the row cannot be placed on a timeline;
+                  it would appear as an orphaned data point in dashboard charts.
+
+      - name: doctor_referral_rate_pct
+        description: >
+          Percentage of completed consults where a doctor issued a referral.
+          Clinical metric; should be broadly stable month-over-month absent
+          genuine clinical change.
+        tests:
+          - not_null:
+              severity: error
+              config:
+                description: >
+                  A null rate makes the cell invisible in dashboards; stakeholders
+                  may interpret absence as zero, misrepresenting care quality.
+          - dbt_utils.expression_is_true:
+              expression: "doctor_referral_rate_pct between 0 and 100"
+              severity: error
+              config:
+                description: >
+                  A rate outside [0, 100] is mathematically impossible and signals
+                  a denominator or rounding error; impossible values in MoH reports
+                  destroy credibility.
+
+      - name: total_consults
+        description: "Count of completed consultations in the month."
+        tests:
+          - not_null:
+              severity: error
+              config:
+                description: >
+                  A null denominator makes all rate calculations undefined;
+                  downstream division by null silently returns null in ClickHouse.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Singular tests (SQL files in tests/) referenced above or standalone
+# ─────────────────────────────────────────────────────────────────────────────
+# See:
+#   tests/assert_referral_rate_no_month_over_month_spike.sql
+#   tests/assert_no_negative_wait_time_after_tz_correction.sql

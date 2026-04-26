@@ -1,0 +1,81 @@
+version: 2
+
+sources:
+  - name: teleclinic_raw
+    description: >
+      Raw operational tables ingested from the Irembo TeleClinic transactional
+      database. No transformations have been applied at this layer. All timestamps
+      are stored as the database received them from the client; the new doctor app
+      (released 2025-04-05) may embed UTC+2 offset strings in consultation_started_at.
+    database: teleclinic        # adjust to actual ClickHouse database name
+    schema: raw
+
+    tables:
+      - name: consultations
+        description: >
+          One row per consultation request. consultation_started_at may contain
+          UTC+2 offset strings for records created by app versions >= 2.0
+          (released 2025-04-05). consultation_created_at is always UTC.
+        columns:
+          - name: consultation_id
+            description: "Surrogate primary key — unique per consultation."
+          - name: patient_id
+            description: >
+              Identifier for the requesting patient. Values prefixed with 'TEST_'
+              are seed / QA accounts and must be excluded from all reporting.
+          - name: provider_id
+            description: "Foreign key to the providers table."
+          - name: consultation_created_at
+            description: "UTC timestamp when the patient submitted the consultation request."
+          - name: consultation_started_at
+            description: >
+              Timestamp when a doctor first joined the consultation. May carry a
+              UTC+2 offset string for records from the new app version; requires
+              normalisation before computing wait times.
+          - name: status
+            description: "Consultation lifecycle status: 'completed', 'cancelled', 'no_show'."
+          - name: channel
+            description: "Request channel: 'app' or 'ussd'."
+          - name: app_version
+            description: "Client app version string at time of request. Null for USSD."
+
+      - name: clinical_outcomes
+        description: >
+          One row per completed consultation recording the doctor's clinical
+          decisions. Joined to consultations on consultation_id.
+        columns:
+          - name: consultation_id
+            description: "Foreign key to consultations.consultation_id."
+          - name: referral_issued
+            description: "Boolean — true when the attending doctor formally issued a referral."
+          - name: diagnosis_code
+            description: "ICD-10 code recorded by the doctor."
+          - name: medication_prescribed
+            description: "Boolean — true when medication was prescribed."
+          - name: follow_up_scheduled
+            description: "Boolean — true when a follow-up appointment was created."
+
+      - name: intake_flags
+        description: >
+          One row per consultation capturing patient-supplied intake form responses.
+          The 'referral_requested' checkbox was added to the intake form on 2025-04-03.
+          Records before that date will have referral_requested = NULL or false.
+        columns:
+          - name: consultation_id
+            description: "Foreign key to consultations.consultation_id."
+          - name: referral_requested
+            description: >
+              Boolean — true when the patient ticked 'referral requested' on the
+              intake form before the consultation. Only populated from 2025-04-03.
+
+      - name: providers
+        description: "Dimension table of clinical providers (doctors, triage nurses)."
+        columns:
+          - name: provider_id
+            description: "Primary key."
+          - name: provider_name
+            description: "Full name of the provider."
+          - name: specialty
+            description: "Clinical specialty (e.g. 'General Practice', 'Paediatrics')."
+          - name: is_active
+            description: "Boolean — false for deactivated or offboarded providers."
